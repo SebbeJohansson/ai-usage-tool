@@ -26,11 +26,13 @@ type Settings struct {
 
 	PollEvery  time.Duration
 	LedgerPath string
+	DisplayTZ  string
 }
 
 const (
 	defaultPollEvery  = 15 * time.Minute
 	defaultLedgerPath = "data/state.json"
+	defaultDisplayTZ  = "Europe/Stockholm"
 )
 
 // FromEnv builds a Settings from the process environment, loading a local
@@ -47,6 +49,7 @@ func FromEnv() (Settings, error) {
 		DiscordHook:      os.Getenv("DISCORD_WEBHOOK_URL"),
 		PollEvery:        defaultPollEvery,
 		LedgerPath:       defaultLedgerPath,
+		DisplayTZ:        defaultDisplayTZ,
 	}
 
 	if raw := os.Getenv("CHECK_INTERVAL"); raw != "" {
@@ -59,6 +62,10 @@ func FromEnv() (Settings, error) {
 
 	if raw := os.Getenv("STATE_FILE"); raw != "" {
 		s.LedgerPath = raw
+	}
+
+	if raw := os.Getenv("DISPLAY_TZ"); raw != "" {
+		s.DisplayTZ = raw
 	}
 
 	return s, nil

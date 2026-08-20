@@ -12,6 +12,10 @@ import (
 	"strings"
 	"time"
 
+	// The runtime image (distroless/static) ships no system tzdata, so
+	// named zones like "Europe/Stockholm" would otherwise fail to load.
+	_ "time/tzdata"
+
 	"ai-usage-mini/internal/claudeusage"
 	"ai-usage-mini/internal/copilotcredit"
 	"ai-usage-mini/internal/notify"
@@ -28,11 +32,24 @@ func main() {
 		log.Fatalf("reading settings: %v", err)
 	}
 
+	ledger, err := thresholds.Open(cfg.LedgerPath)
+	if err != nil {
+		log.Printf("ledger unreadable, starting fresh: %v", err)
+		ledger = &thresholds.Ledger{Announced: map[string]int{}}
+	}
+
+	displayLoc, err := time.LoadLocation(cfg.DisplayTZ)
+	if err != nil {
+		log.Fatalf("DISPLAY_TZ %q: %v", cfg.DisplayTZ, err)
+	}
+
 	checker := &Checker{
-		cfg:     cfg,
-		claude:  claudeusage.New(cfg.AnthropicOrg, cfg.AnthropicSession),
-		copilot: copilotcredit.New(cfg.CopilotOrg, cfg.CopilotToken),
-		discord: notify.NewDiscord(cfg.DiscordHook),
+		cfg:        cfg,
+		claude:     claudeusage.New(cfg.AnthropicOrg, cfg.AnthropicSession),
+		copilot:    copilotcredit.New(cfg.CopilotOrg, cfg.CopilotToken),
+		discord:    notify.NewDiscord(cfg.DiscordHook),
+		ledger:     ledger,
+		displayLoc: displayLoc,
 	}
 
 	if *singleShot {
@@ -51,21 +68,17 @@ func main() {
 // against the on-disk ledger, and notify Discord for anything newly
 // noteworthy.
 type Checker struct {
-	cfg     settings.Settings
-	claude  *claudeusage.Client
-	copilot *copilotcredit.Client
-	discord *notify.Discord
+	cfg        settings.Settings
+	claude     *claudeusage.Client
+	copilot    *copilotcredit.Client
+	discord    *notify.Discord
+	ledger     *thresholds.Ledger
+	displayLoc *time.Location
 }
 
 func (c *Checker) Run() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-
-	ledger, err := thresholds.Open(c.cfg.LedgerPath)
-	if err != nil {
-		log.Printf("ledger unreadable, starting fresh: %v", err)
-		ledger = &thresholds.Ledger{Announced: map[string]int{}}
-	}
 
 	reading := c.pollClaude(ctx)
 	report := c.pollCopilot(ctx)
@@ -82,12 +95,12 @@ func (c *Checker) Run() {
 			continue
 		}
 		step := stepFor(m.Kind)
-		if ledger.Advance(m.ID(), floorToStep(m.PctUsed, step)) {
+		if c.ledger.Advance(m.ID(), floorToStep(m.PctUsed, step)) {
 			raised = append(raised, m)
 		}
 	}
 
-	if err := ledger.Persist(c.cfg.LedgerPath); err != nil {
+	if err := c.ledger.Persist(c.cfg.LedgerPath); err != nil {
 		log.Printf("could not save ledger: %v", err)
 	}
 
@@ -95,7 +108,7 @@ func (c *Checker) Run() {
 		return
 	}
 
-	body := composeAlert(reading, raised, report)
+	body := composeAlert(reading, raised, report, c.displayLoc)
 	if c.cfg.DiscordHook == "" {
 		log.Printf("would notify (no DISCORD_WEBHOOK_URL configured):\n%s", body)
 		return
@@ -133,13 +146,14 @@ func (c *Checker) pollCopilot(ctx context.Context) *copilotcredit.Report {
 
 // stepFor returns how many percentage points must pass before a meter's
 // climb is worth a new alert. "session" resets roughly every five hours, so
-// a fine 5-point step would fire almost continuously; it gets a coarser
-// 25-point step instead.
+// a fine step would fire almost continuously; it gets a coarse 25-point
+// step. The weekly meter ("weekly_scoped") moves much more slowly, so a
+// 10-point step is fine enough to still catch meaningful jumps.
 func stepFor(kind string) int {
 	if kind == "session" {
 		return 25
 	}
-	return 5
+	return 10
 }
 
 func floorToStep(pct float64, step int) int {
@@ -174,12 +188,13 @@ func oneLineStatus(reading *claudeusage.Reading, report *copilotcredit.Report) s
 	return "poll: " + strings.Join(parts, " ")
 }
 
-// composeAlert renders every live Claude meter (marking the ones in raised)
-// plus a snapshot of Copilot credit usage as context. Copilot has no step of
-// its own here — one person's draw against an org-wide credit pool isn't a
-// meaningful percentage by itself — so it just rides along with whatever
-// triggered the message.
-func composeAlert(reading *claudeusage.Reading, raised []claudeusage.Meter, report *copilotcredit.Report) string {
+// composeAlert renders every Claude meter (marking the ones in raised) plus
+// a snapshot of Copilot credit usage as context, so a message always shows
+// the full picture rather than just whichever meter happened to trigger it.
+// Copilot has no step of its own here — one person's draw against an
+// org-wide credit pool isn't a meaningful percentage by itself — so it just
+// rides along with whatever triggered the message.
+func composeAlert(reading *claudeusage.Reading, raised []claudeusage.Meter, report *copilotcredit.Report, displayLoc *time.Location) string {
 	raisedIDs := map[string]bool{}
 	for _, m := range raised {
 		raisedIDs[m.ID()] = true
@@ -188,16 +203,13 @@ func composeAlert(reading *claudeusage.Reading, raised []claudeusage.Meter, repo
 	var b strings.Builder
 	b.WriteString("**Claude quota update**\n")
 	for _, m := range reading.Meters {
-		if !m.Live {
-			continue
-		}
 		flag := "•"
 		if raisedIDs[m.ID()] {
 			flag = "▲"
 		}
 		fmt.Fprintf(&b, "%s %s: %.0f%%", flag, m.ID(), m.PctUsed)
 		if m.ResetsAt != nil {
-			fmt.Fprintf(&b, " (resets %s)", m.ResetsAt.Local().Format("Mon 15:04"))
+			fmt.Fprintf(&b, " (resets %s)", m.ResetsAt.In(displayLoc).Format("Mon 15:04"))
 		}
 		b.WriteString("\n")
 	}
